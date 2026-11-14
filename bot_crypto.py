@@ -11,7 +11,9 @@ Uso:
   python3 bot_crypto.py backtest            # testa la strategia sugli ultimi mesi
   python3 bot_crypto.py backtest ETH-EUR    # idem su Ethereum
   python3 bot_crypto.py confronta           # prova 30 min, 1 ora, 4 ore, 1 giorno
+  python3 bot_crypto.py verifica            # 4 ore su BTC, ETH, SOL in 3 periodi, con/senza filtro
   python3 bot_crypto.py paper               # simulazione dal vivo (Ctrl+C per fermare)
+  python3 bot_crypto.py giro                # un controllo e basta (per GitHub Actions)
 
 Figure riconosciute (entrata solo alla ROTTURA della linea, come da manuale):
   Inversione:    doppio massimo/minimo, triplo massimo/minimo,
@@ -47,16 +49,30 @@ ZIGZAG_SOGLIA = ZIGZAG_PER_INTERVALLO.get(INTERVALLO_MIN, 0.04)
 TOLLERANZA = 0.02        # due massimi "uguali" se distano meno del 2%
 FINESTRA = 200           # candele analizzate per cercare le figure
 MAX_ETA_FIGURA = 40      # una figura vale solo se l'ultimo punto è recente
+FILTRO_TREND = False     # True = compra solo se il prezzo è sopra la media lunga
+EMA_TREND = 200          # candele della media lunga usata dal filtro
+COPPIE_GIRO = ["BTC-EUR", "ETH-EUR", "SOL-EUR"]  # crypto seguite in simulazione
 FILE_STATO = "stato_paper.json"
 FILE_REGISTRO = "operazioni.csv"
 FILE_GRAFICO = "grafico_pattern.svg"
 # ----------------------------------------------------------
 
 
-def _get_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "bot-crypto/1.0"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read())
+def _get_json(url, tentativi=6):
+    """Scarica JSON; se il server dice "troppe richieste" (429) aspetta e riprova."""
+    import urllib.error
+    attesa = 5
+    for n in range(tentativi):
+        req = urllib.request.Request(url, headers={"User-Agent": "bot-crypto/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code != 429 or n == tentativi - 1:
+                raise
+            print(f"  troppe richieste, aspetto {attesa} secondi...")
+            time.sleep(attesa)
+            attesa *= 2
 
 
 def _scarica_revolut(coppia, intervallo, quante):
@@ -74,7 +90,7 @@ def _scarica_revolut(coppia, intervallo, quante):
                 "t": int(c["start"]) // 1000, "o": float(c["open"]), "h": float(c["high"]),
                 "l": float(c["low"]), "c": float(c["close"])}
         until = since
-        time.sleep(1.1)  # limite Revolut: 1 richiesta al secondo
+        time.sleep(3)  # Revolut accetta poche richieste: vado piano
     return [candele[t] for t in sorted(candele)][-quante:]
 
 
@@ -260,6 +276,22 @@ def cerca_figure(cs, i):
 # ------------------------------------------------------------------
 # 4) TRADING SIMULATO
 # ------------------------------------------------------------------
+_cache_ema = {}
+
+
+def media_lunga(cs, i):
+    """Media mobile esponenziale lunga (EMA) delle chiusure, calcolata una volta per serie."""
+    chiave = (id(cs), len(cs))
+    if chiave not in _cache_ema:
+        k, prec, out = 2 / (EMA_TREND + 1), None, []
+        for c in cs:
+            prec = c["c"] if prec is None else c["c"] * k + prec * (1 - k)
+            out.append(prec)
+        _cache_ema.clear()
+        _cache_ema[chiave] = out
+    return _cache_ema[chiave][i]
+
+
 def decidi(i, cs, stato):
     """Restituisce (azione, motivo, figura) per la candela i."""
     prezzo = cs[i]["c"]
@@ -273,6 +305,8 @@ def decidi(i, cs, stato):
             if f["dir"] == "ribasso":
                 return "VENDI", f["nome"], f
     else:
+        if FILTRO_TREND and (i < EMA_TREND or prezzo < media_lunga(cs, i)):
+            return None, "", None  # mercato non in salita di fondo: non compro
         for f in figure:
             if f["dir"] == "rialzo" and f["stop"] < prezzo:
                 return "COMPRA", f["nome"], f
@@ -301,10 +335,9 @@ def data(ts):
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
-def backtest(cs, verbose=True, riepilogo=True):
+def backtest(cs, verbose=True, riepilogo=True, inizio=50):
     stato = stato_nuovo()
     operazioni, vinte, picco, max_dd = 0, 0, CAPITALE_INIZIALE, 0.0
-    inizio = 50
     for i in range(inizio, len(cs)):
         c = cs[i]
         azione, motivo, figura = decidi(i, cs, stato)
@@ -346,6 +379,7 @@ def confronta(coppia, intervalli=(30, 60, 240, 1440)):
         INTERVALLO_MIN = iv
         ZIGZAG_SOGLIA = ZIGZAG_PER_INTERVALLO.get(iv, 0.04)
         print(f"Scarico candele da {iv} min...")
+        time.sleep(5)  # pausa tra un intervallo e l'altro
         try:
             cs = scarica_candele(coppia, iv)
         except Exception as e:
@@ -363,6 +397,64 @@ def confronta(coppia, intervalli=(30, 60, 240, 1440)):
               f"{r['operazioni']:>8} {r['vinte']:>6} {-r['max_dd'] * 100:>8.1f}%")
     print("\nNota: ogni intervallo copre un periodo diverso (stesso numero di candele),")
     print("quindi confronta soprattutto 'Bot' con 'Compra&tieni' sulla stessa riga.")
+    return righe
+
+
+def verifica(coppie=("BTC-EUR", "ETH-EUR", "SOL-EUR"), intervallo=240, periodi=3, candele=3000):
+    """Prova di robustezza: stessa strategia su più crypto e più periodi, con e senza filtro."""
+    global INTERVALLO_MIN, ZIGZAG_SOGLIA, FILTRO_TREND
+    INTERVALLO_MIN = intervallo
+    ZIGZAG_SOGLIA = ZIGZAG_PER_INTERVALLO.get(intervallo, 0.04)
+    riscaldamento = max(EMA_TREND, FINESTRA) + 10
+    righe = []
+    for coppia in coppie:
+        print(f"Scarico {coppia} (candele da {intervallo} min)...")
+        time.sleep(5)
+        try:
+            cs = scarica_candele(coppia, intervallo, quante=candele)
+        except Exception as e:
+            print(f"  saltato: {e}")
+            continue
+        usabili = len(cs) - riscaldamento
+        if usabili < periodi * 100:
+            print(f"  saltato: storia troppo corta ({len(cs)} candele)")
+            continue
+        passo = usabili // periodi
+        for p in range(periodi):
+            a = riscaldamento + p * passo
+            b = len(cs) if p == periodi - 1 else a + passo
+            pezzo = cs[a - riscaldamento:b]
+            ris = {}
+            for filtro in (False, True):
+                FILTRO_TREND = filtro
+                _cache_ema.clear()
+                ris[filtro] = backtest(pezzo, verbose=False, riepilogo=False, inizio=riscaldamento)
+            righe.append((coppia, cs[a]["t"], cs[b - 1]["t"], ris))
+    FILTRO_TREND = False
+
+    pct = lambda v: (v / CAPITALE_INIZIALE - 1) * 100
+    print(f"\n========== VERIFICA ROBUSTEZZA (candele {intervallo} min) ==========")
+    print(f"{'Crypto':8} {'Periodo':17} {'C&tieni':>8} {'Bot':>7} {'Bot+filtro':>11} {'Op.':>4}")
+    vinti = {False: 0, True: 0}
+    diff = {False: 0.0, True: 0.0}
+    for coppia, t0, t1, ris in righe:
+        hold = pct(ris[False]["hold"])
+        b0, b1 = pct(ris[False]["finale"]), pct(ris[True]["finale"])
+        for f in (False, True):
+            vinti[f] += ris[f]["finale"] > ris[f]["hold"]
+            diff[f] += pct(ris[f]["finale"]) - hold
+        periodo = datetime.fromtimestamp(t0, timezone.utc).strftime("%m/%y") + "-" + \
+            datetime.fromtimestamp(t1, timezone.utc).strftime("%m/%y")
+        print(f"{coppia[:3]:8} {periodo:17} {hold:>+7.1f}% {b0:>+6.1f}% {b1:>+10.1f}% "
+              f"{ris[False]['operazioni']:>4}")
+    n = len(righe)
+    if n:
+        print("\n--- Sintesi ---")
+        for f, nome in ((False, "Bot senza filtro"), (True, "Bot con filtro  ")):
+            print(f"{nome}: batte compra&tieni in {vinti[f]} periodi su {n}, "
+                  f"differenza media {diff[f] / n:+.1f} punti")
+        print("\nUn vantaggio vero deve vincere nella maggior parte dei periodi e su tutte")
+        print("le crypto, non solo in quelli in cui il mercato è sceso.")
     return righe
 
 
@@ -424,7 +516,7 @@ def registra(riga):
     nuovo = not os.path.exists(FILE_REGISTRO)
     with open(FILE_REGISTRO, "a") as f:
         if nuovo:
-            f.write("data,azione,prezzo,motivo,valore_portafoglio\n")
+            f.write("data,coppia,azione,prezzo,motivo,valore_portafoglio\n")
         f.write(riga + "\n")
 
 
@@ -452,20 +544,114 @@ def paper():
                 print(f"{data(c['t'])}  prezzo {c['c']:.2f} €  -> {msg:7} "
                       f"| portafoglio {valore:.2f} € {('(' + motivo + ')') if motivo else ''}")
                 if azione:
-                    registra(f"{data(c['t'])},{azione},{c['c']:.2f},{motivo},{valore:.2f}")
+                    registra(f"{data(c['t'])},{COPPIA},{azione},{c['c']:.2f},{motivo},{valore:.2f}")
         except Exception as e:
             print(f"Errore temporaneo: {e} - riprovo tra 5 minuti")
         time.sleep(300)
 
 
+# ------------------------------------------------------------------
+# 7) GIRO SINGOLO + TELEGRAM (per GitHub Actions, ogni 4 ore)
+# ------------------------------------------------------------------
+def telegram(testo):
+    """Invia un messaggio Telegram se TELEGRAM_TOKEN e TELEGRAM_CHAT_ID sono impostati."""
+    print(testo)
+    token, chat = os.environ.get("TELEGRAM_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return
+    import urllib.parse
+    dati = urllib.parse.urlencode({"chat_id": chat, "text": testo}).encode()
+    try:
+        urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", dati, timeout=30)
+    except Exception as e:
+        print(f"Telegram non raggiungibile: {e}")
+
+
+def _candele_robuste(coppia):
+    """Prova Revolut X; se non risponde usa Kraken."""
+    global FONTE
+    originale = FONTE
+    try:
+        return scarica_candele(coppia, INTERVALLO_MIN, quante=FINESTRA + 60)
+    except Exception as e:
+        print(f"{coppia}: Revolut non disponibile ({e}), provo Kraken")
+        FONTE = "kraken"
+        try:
+            return scarica_candele(coppia, INTERVALLO_MIN)
+        finally:
+            FONTE = originale
+
+
+def giro():
+    portafogli = {}
+    primo_avvio = not os.path.exists(FILE_STATO)
+    if not primo_avvio:
+        with open(FILE_STATO) as f:
+            portafogli = json.load(f)
+    nomi = {"BTC-EUR": "Bitcoin", "ETH-EUR": "Ethereum", "SOL-EUR": "Solana"}
+    righe_stato = []
+    for coppia in COPPIE_GIRO:
+        stato = stato_nuovo()
+        stato.update(portafogli.get(coppia, {}))
+        try:
+            cs = _candele_robuste(coppia)
+        except Exception as e:
+            print(f"{coppia}: dati non disponibili ({e})")
+            continue
+        nuove = [j for j in range(len(cs)) if cs[j]["t"] > stato["ultima_candela"]]
+        if not stato["ultima_candela"]:
+            nuove = nuove[-1:]  # al primo avvio guardo solo l'ultima candela
+        for j in nuove:
+            c = cs[j]
+            azione, motivo, figura = decidi(j, cs, stato)
+            if azione:
+                acquisto = stato["prezzo_acquisto"]
+                esegui(azione, c["c"], stato, figura)
+                valore = stato["euro"] + stato["crypto"] * c["c"]
+                if azione == "COMPRA":
+                    msg = (f"🟢 [SIMULAZIONE] COMPRA {nomi.get(coppia, coppia)} a {c['c']:,.2f} €\n"
+                           f"Figura: {motivo}\nStop: {stato['stop']:,.2f} € · "
+                           f"Obiettivo: {stato['obiettivo']:,.2f} €")
+                else:
+                    esito = (c["c"] / acquisto - 1) * 100 if acquisto else 0
+                    msg = (f"🔴 [SIMULAZIONE] VENDE {nomi.get(coppia, coppia)} a {c['c']:,.2f} €\n"
+                           f"Motivo: {motivo} · Risultato operazione: {esito:+.1f}%\n"
+                           f"Portafoglio {coppia[:3]}: {valore:,.2f} €")
+                telegram(msg)
+                registra(f"{data(c['t'])},{coppia},{azione},{c['c']:.2f},{motivo},{valore:.2f}")
+            stato["ultima_candela"] = c["t"]
+        portafogli[coppia] = stato
+        valore = stato["euro"] + stato["crypto"] * cs[-1]["c"]
+        posizione = "investito" if stato["crypto"] > 0 else "in euro"
+        righe_stato.append(f"{nomi.get(coppia, coppia)}: {valore:,.2f} € ({posizione})")
+        time.sleep(3)
+
+    oggi = datetime.now(timezone.utc)
+    settimana = oggi.strftime("%G-%V")
+    if primo_avvio:
+        telegram("🤖 Bot crypto avviato in SIMULAZIONE (nessun soldo vero).\n"
+                 f"Controllo ogni 4 ore {', '.join(c[:3] for c in COPPIE_GIRO)}, "
+                 f"{CAPITALE_INIZIALE:,.0f} € virtuali per ciascuna.\n\n" + "\n".join(righe_stato))
+        portafogli["_ultimo_riepilogo"] = settimana
+    elif oggi.weekday() == 0 and portafogli.get("_ultimo_riepilogo") != settimana and righe_stato:
+        telegram("📊 Riepilogo settimanale (simulazione)\n" + "\n".join(righe_stato))
+        portafogli["_ultimo_riepilogo"] = settimana
+    with open(FILE_STATO, "w") as f:
+        json.dump(portafogli, f, indent=2)
+
+
 if __name__ == "__main__":
-    modo = sys.argv[1] if len(sys.argv) > 1 else "confronta"  # senza argomenti: confronto intervalli
+    modo = sys.argv[1] if len(sys.argv) > 1 else "verifica"  # senza argomenti: verifica di robustezza
     if len(sys.argv) > 2:
         COPPIA = sys.argv[2].upper()
     if modo == "backtest":
         backtest(scarica_candele(COPPIA, INTERVALLO_MIN))
     elif modo == "confronta":
         confronta(COPPIA)
+    elif modo == "verifica":
+        verifica()
+    elif modo == "giro":
+        giro()
     elif modo == "pattern":
         scansione(scarica_candele(COPPIA, INTERVALLO_MIN))
     elif modo == "paper":
