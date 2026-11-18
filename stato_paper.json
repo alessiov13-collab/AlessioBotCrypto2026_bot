@@ -5,7 +5,7 @@
     "stop": 0.0,
     "obiettivo": 0.0,
     "prezzo_acquisto": 0.0,
-    "ultima_candela": 1794945600
+    "ultima_candela": 1794960000
   },
   "ETH-EUR": {
     "euro": 0.0,
@@ -13,7 +13,7 @@
     "stop": 1590.53,
     "obiettivo": 1888.2044444444443,
     "prezzo_acquisto": 1657.64,
-    "ultima_candela": 1794945600
+    "ultima_candela": 1794960000
   },
   "SOL-EUR": {
     "euro": 1000.0,
@@ -21,7 +21,7 @@
     "stop": 0.0,
     "obiettivo": 0.0,
     "prezzo_acquisto": 0.0,
-    "ultima_candela": 1794945600
+    "ultima_candela": 1794960000
   },
   "_ultimo_riepilogo": "2026-47"
 }
